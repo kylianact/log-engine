@@ -5,6 +5,7 @@ sous forme de dictionnaire, ou None. Les règles qui doivent se souvenir du
 passé rangent leurs données dans kwargs["state"].
 """
 
+from collections import defaultdict
 from datetime import timedelta
 from typing import Any, Callable
 
@@ -22,6 +23,18 @@ from logengine.config import (
 )
 
 
+def group_records(records: list, blacklist: frozenset) -> dict:
+    """Prépare les groupes de lignes lus par les règles."""
+    groups = defaultdict(list)
+    for record in records:
+        groups[record.get("service")].append(record)
+        if record.get("level") == "CRITICAL":
+            groups["critical"].append(record)
+        if record.get("ip") in blacklist:
+            groups["blacklisted"].append(record)
+    return groups
+
+
 def apply_security_rules(*args: Callable, **kwargs: Any) -> list:
     """Applique un nombre variable de règles à un lot d'enregistrements.
 
@@ -30,9 +43,13 @@ def apply_security_rules(*args: Callable, **kwargs: Any) -> list:
     Une règle qui plante est comptée, et les autres continuent.
     """
     records = kwargs.pop("records")
+    groups = group_records(records, kwargs.get("blacklist", ()))
     alerts = []
     for rule in args:
-        for record in records:
+        # Une règle ne lit que les lignes qui la concernent. Une règle
+        # absente de RULE_TARGETS les lit toutes.
+        target = RULE_TARGETS.get(rule)
+        for record in records if target is None else groups[target]:
             try:
                 alert = rule(record, **kwargs)
             except (KeyError, TypeError, AttributeError, ValueError):
@@ -174,6 +191,18 @@ def rule_rogue_config(record: dict, **kwargs: Any) -> dict | None:
     detail = f"routeur configuré par le compte {record['user']}"
     return make_alert("rogue_config", record["ip"], record, detail)
 
+
+# Groupe de lignes lu par chaque règle.
+RULE_TARGETS = {
+    rule_blacklist: "blacklisted",
+    rule_web_attack: "web",
+    rule_exfiltration: "web",
+    rule_critical_event: "critical",
+    rule_port_scan: "firewall",
+    rule_password_spray: "auth",
+    rule_impossible_travel: "vpn",
+    rule_rogue_config: "router",
+}
 
 ALL_RULES = (
     rule_blacklist,

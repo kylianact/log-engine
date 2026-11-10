@@ -6,10 +6,18 @@ from collections import defaultdict
 from logengine.config import ERROR_LEVELS
 
 
+NUMBER_IN_PATH = re.compile(r"/\d+")
+
+
 def top_items(counts: dict, size: int = 10) -> list:
     """Retourne les plus grands compteurs d'un dictionnaire."""
     ranked = sorted(counts.items(), key=lambda item: item[1], reverse=True)
     return ranked[:size]
+
+
+def days_as_text(counts: dict) -> dict:
+    """Trie les jours et les écrit sous la forme 2026-10-01."""
+    return {day.isoformat(): count for day, count in sorted(counts.items())}
 
 
 def compare_with_blacklist(
@@ -39,7 +47,6 @@ class Aggregator:
     """
 
     def __init__(self) -> None:
-        self.active_ips = set()
         self.error_ips = set()
         self.by_level = defaultdict(int)
         self.by_service = defaultdict(int)
@@ -61,15 +68,16 @@ class Aggregator:
         for record in batch:
             ip = record["ip"]
             level = record["level"]
-            day = record["timestamp"].strftime("%Y-%m-%d")
-            self.active_ips.add(ip)
+            moment = record["timestamp"]
+            # Une date sert de clé : le texte n'est créé qu'à la fin.
+            day = moment.date()
             self.by_ip[ip] += 1
             self.by_level[level] += 1
             self.by_service[record["service"]] += 1
             self.by_tag[record["tag"]] += 1
             self.by_route[record["route"]] += 1
             self.by_day[day] += 1
-            self.by_hour[record["timestamp"].hour] += 1
+            self.by_hour[moment.hour] += 1
             if record["user"] is not None:
                 self.by_user[record["user"]] += 1
             if level in ERROR_LEVELS:
@@ -88,7 +96,7 @@ class Aggregator:
         elif isinstance(payload, dict) and "status" in payload:
             self.by_status[payload["status"]] += 1
             path = payload.get("path", "").split("?")[0]
-            self.by_endpoint[re.sub(r"/\d+", "/:id", path)] += 1
+            self.by_endpoint[NUMBER_IN_PATH.sub("/:id", path)] += 1
 
     def to_dict(self, blacklist: frozenset) -> dict:
         """Construit le résumé final."""
@@ -106,10 +114,10 @@ class Aggregator:
             "top_error_ips": top_items(self.errors_by_ip),
             "top_endpoints": top_items(self.by_endpoint),
             "top_ports": top_items(self.by_port),
-            "by_day": dict(sorted(self.by_day.items())),
-            "errors_by_day": dict(sorted(self.errors_by_day.items())),
+            "by_day": days_as_text(self.by_day),
+            "errors_by_day": days_as_text(self.errors_by_day),
             "by_hour": dict(sorted(self.by_hour.items())),
             "ip_sets": compare_with_blacklist(
-                self.active_ips, self.error_ips, blacklist
+                set(self.by_ip), self.error_ips, blacklist
             ),
         }

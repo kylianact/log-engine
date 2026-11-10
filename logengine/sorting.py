@@ -27,9 +27,11 @@ def format_record(record: dict) -> str:
     stamp = record["timestamp"].isoformat(timespec="milliseconds")
     ip, port, protocol = record["meta"]
     user = record["user"] or "-"
+    # Recopier le texte d'origine évite de le reconstruire à chaque ligne.
+    text = record.get("text") or format_payload(record)
     return (
         f"{stamp}Z | {record['level']} | {ip}:{port}/{protocol} | {user} | "
-        f"{record['service']} | {format_payload(record)}"
+        f"{record['service']} | {text}"
     )
 
 
@@ -48,15 +50,18 @@ class LogSorter:
 
     def write(self, batch: list) -> None:
         """Range un lot d'enregistrements."""
+        lines = defaultdict(list)
         for record in batch:
-            service = record["service"]
+            lines[record["service"]].append(format_record(record))
+        # Une seule écriture par type de log : le disque travaille moins.
+        for service, texts in lines.items():
             if service not in KNOWN_SERVICES:
                 service = "other"
             if service not in self.files:
                 path = os.path.join(self.folder, f"{service}.log")
                 self.files[service] = open(path, "w", encoding="utf-8")
-            self.files[service].write(format_record(record) + "\n")
-            self.counts[service] += 1
+            self.files[service].write("\n".join(texts) + "\n")
+            self.counts[service] += len(texts)
 
     def close(self) -> None:
         """Ferme tous les fichiers."""

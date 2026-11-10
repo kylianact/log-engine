@@ -16,6 +16,9 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Iterator
 
+from logengine.display import print_generated
+from logengine.monitor import current_ram, format_duration
+
 # Part du volume total pour chaque type de log.
 SERVICES = {
     "web": 0.22,
@@ -817,6 +820,7 @@ def finish_line(parts: tuple, service: str, moment: datetime, state: dict,
         defect, line = apply_defect(random.choice(choices), fields, moment)
     if line is None:
         line = join_fields(fields)
+    state["shown"] = (service, defect or "ligne propre")
     if defect in NOISE_DEFECTS:
         state["injected"][defect] += 1
         return line
@@ -857,11 +861,14 @@ def web_side_line(moment: datetime, pools: dict, state: dict) -> str | None:
             '"bytes":2,"latency_ms":1,"agent":"kube-probe/1.31"}'
         )
         parts = ("INFO", f"10.0.0.5:{random_port()}/TCP", "-", payload)
-        return finish_line(parts, "web", moment, state, False, True)
+        line = finish_line(parts, "web", moment, state, False, True)
+        state["shown"] = ("web", "healthcheck")
+        return line
     if draw < 0.03:
         # Une ancienne application écrit encore au format du TP6.
         state["injected"]["legacy_format"] += 1
         state["previous"] = None
+        state["shown"] = ("web", "legacy_format")
         stamp = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
         status = random.choice(STATUS_CHOICES)
         return (
@@ -906,7 +913,10 @@ def iter_day(job: dict, pools: dict, state: dict) -> Iterator[str]:
                 state["truth"]["blacklist_active"].add(flags["blacklisted"])
             clean = "secret" in flags
             safe = "blacklisted" in flags
-            yield finish_line(parts, service, moment, state, safe, clean)
+            line = finish_line(parts, service, moment, state, safe, clean)
+            if clean:
+                state["shown"] = (service, "secret_in_log")
+            yield line
     while plan:
         planned, service, parts = plan.pop(0)
         yield finish_line(parts, service, planned, state, True, False)
@@ -916,6 +926,7 @@ def new_state() -> dict:
     """Crée le suivi de la génération."""
     return {
         "previous": None,
+        "shown": ("", ""),
         "injected": defaultdict(int),
         "truth": defaultdict(set),
     }
@@ -962,9 +973,16 @@ def plan_days(total_lines: int, days: int) -> list:
 
 
 def generate_dataset(
-    path: str, target: int, days: int = 30, seed: int = 42
+    path: str,
+    target: int,
+    days: int = 30,
+    seed: int = 42,
+    show: int | None = None,
 ) -> dict:
-    """Génère le fichier de logs, sa liste noire et son manifeste."""
+    """Génère le fichier de logs, sa liste noire et son manifeste.
+
+    show affiche les premières lignes créées, ou toutes s'il vaut 0.
+    """
     folder = os.path.dirname(path)
     if folder:
         os.makedirs(folder, exist_ok=True)
@@ -978,8 +996,16 @@ def generate_dataset(
         for number, job in enumerate(jobs, start=1):
             for line in iter_day(job, pools, state):
                 file.write(line + "\n")
+                first = line_count + 1
                 line_count += 1 + line.count("\n")
-            print(f"Jour {number}/{days} : {line_count} lignes")
+                if show == 0 or (show is not None and first <= show):
+                    print_generated(first, line, *state["shown"])
+            print(
+                f"Jour {number}/{days} : {line_count} lignes, "
+                f"RAM {current_ram():.0f} Mo, "
+                f"{format_duration(time.time() - started)}",
+                flush=True,
+            )
     size = os.path.getsize(path)
 
     with open(os.path.join(folder, "blacklist.conf"), "w",

@@ -1,5 +1,7 @@
 """Tests du projet. Lancement : python tests/test_project.py"""
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -13,8 +15,12 @@ import main as cli  # noqa: E402
 from logengine import audit  # noqa: E402
 from logengine.aggregation import compare_with_blacklist  # noqa: E402
 from logengine.bruteforce import BruteForceDetector  # noqa: E402
-from logengine.generator import generate_dataset  # noqa: E402
+from logengine.display import DEFECT_LABELS, LineDisplay  # noqa: E402
+from logengine.display import line_status, print_raw_lines  # noqa: E402
+from logengine.display import trace_stream, visible  # noqa: E402
+from logengine.generator import ALL_DEFECTS, generate_dataset  # noqa: E402
 from logengine.ingestion import limit_lines, read_log_file  # noqa: E402
+from logengine.monitor import LiveMonitor, format_duration  # noqa: E402
 from logengine.ingestion import read_sources  # noqa: E402
 from logengine.parsing import parse_line  # noqa: E402
 from logengine.pipeline import make_batches, run_pipeline  # noqa: E402
@@ -371,6 +377,219 @@ def test_command_line_runs_and_sorts() -> None:
     assert written == total
 
 
+def quietly(function, *args, **kwargs):
+    """Appelle une fonction sans laisser ses print dans le terminal."""
+    with open(os.devnull, "w", encoding="utf-8") as sink:
+        with contextlib.redirect_stdout(sink):
+            return function(*args, **kwargs)
+
+
+class StatusRecorder(LineDisplay):
+    """Retient l'état de chaque ligne au lieu de l'afficher."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.statuses = []
+
+    def show(self, number, line, trace, records) -> None:
+        self.statuses.append(line_status(trace))
+
+
+def read_folder(folder: str) -> dict:
+    """Lit tous les fichiers d'un dossier."""
+    content = {}
+    for name in os.listdir(folder):
+        with open(os.path.join(folder, name), encoding="utf-8") as file:
+            content[name] = file.read()
+    return content
+
+
+def test_visible_shows_hidden_characters() -> None:
+    assert visible("déjà vu") == "déjà vu"
+    assert visible("a\x1b[31m\tb") == "a<1b>[31m<09>b"
+
+
+def test_every_defect_has_a_label() -> None:
+    for name in set(ALL_DEFECTS):
+        assert name in DEFECT_LABELS, name
+
+
+def test_status_of_each_kind_of_line() -> None:
+    probe = CLEAN_LINE.replace(
+        '{"level":"ERROR","code":503}', '{"path":"/health","status":200}'
+    )
+    lines = [
+        CLEAN_LINE + "\n",
+        "\n",
+        "# commentaire\n",
+        CLEAN_LINE + "\n",
+        "CORRUPTED_LINE_WITHOUT_FORMAT\n",
+        CLEAN_LINE.replace("ERROR |", "err |", 1) + "\n",
+        probe + "\n",
+    ]
+    display = StatusRecorder()
+    quality = new_quality_counters()
+    with open(os.devnull, "w", encoding="utf-8") as bad_lines:
+        records = list(trace_stream(lines, quality, bad_lines, display))
+    assert display.statuses == [
+        "ok", "ignoree", "ignoree", "doublon", "rejetee", "reparee", "sonde"
+    ]
+    assert len(records) == 2
+    assert quality["funnel"]["read"] == 7
+    assert quality["repairs"]["duplicate"] == 1
+
+
+def test_show_gives_the_same_results() -> None:
+    path = os.path.join(WORK, "dataset_show", "logs.log")
+    shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+    quietly(generate_dataset, path, 3000000, 1, 11)
+    first = os.path.join(WORK, "run_normal")
+    second = os.path.join(WORK, "run_show")
+    normal = quietly(run_pipeline, [path], first)
+    shown = quietly(run_pipeline, [path], second, display=LineDisplay())
+    assert shown["quality"] == normal["quality"]
+    assert shown["sorted_lines"] == normal["sorted_lines"]
+    assert shown["aggregates"] == normal["aggregates"]
+    assert shown["evaluation"] == normal["evaluation"]
+    assert shown["detection"]["published"] == normal["detection"]["published"]
+    first_tri = read_folder(os.path.join(first, "tri"))
+    assert read_folder(os.path.join(second, "tri")) == first_tri
+
+
+def test_show_stops_after_the_limit() -> None:
+    path = os.path.join(WORK, "dataset_show", "logs.log")
+    output = os.path.join(WORK, "run_limit")
+    summary = quietly(run_pipeline, [path], output, display=LineDisplay(5))
+    assert summary["quality"]["funnel"]["read"] == 5
+    assert "evaluation" not in summary
+
+
+def test_only_keeps_one_kind_of_line() -> None:
+    path = os.path.join(WORK, "dataset_show", "logs.log")
+    output = os.path.join(WORK, "run_only")
+    display = LineDisplay(2, "rejetee")
+    summary = quietly(run_pipeline, [path], output, display=display)
+    assert display.shown == 2
+    assert sum(summary["quality"]["rejects"].values()) == 2
+    display = LineDisplay(1, "alerte")
+    summary = quietly(run_pipeline, [path], output, display=display)
+    assert sum(summary["detection"]["published"].values()) == 1
+
+
+def test_show_does_not_change_the_generated_file() -> None:
+    first = os.path.join(WORK, "gen_a", "logs.log")
+    second = os.path.join(WORK, "gen_b", "logs.log")
+    quietly(generate_dataset, first, 300000, 1, 12)
+    quietly(generate_dataset, second, 300000, 1, 12, 10)
+    with open(first, "rb") as file:
+        content = file.read()
+    with open(second, "rb") as file:
+        assert file.read() == content
+
+
+def test_raw_lines_are_shown_and_passed_on() -> None:
+    lines = ["a\n", "b\n", "\n", "password=abc\n"]
+    screen = io.StringIO()
+    with contextlib.redirect_stdout(screen):
+        assert list(print_raw_lines(iter(lines), 2)) == lines
+    assert screen.getvalue() == "2 | b\n4 | password=***\n"
+
+
+def test_raw_gives_the_same_results() -> None:
+    path = os.path.join(WORK, "dataset_show", "logs.log")
+    normal = quietly(run_pipeline, [path], os.path.join(WORK, "run_a"))
+    raw = quietly(
+        run_pipeline, [path], os.path.join(WORK, "run_b"), raw_every=1
+    )
+    assert raw["quality"] == normal["quality"]
+    assert raw["sorted_lines"] == normal["sorted_lines"]
+    assert raw["evaluation"] == normal["evaluation"]
+
+
+def test_command_line_raw_option() -> None:
+    assert cli.raw_every({}) == 0
+    assert cli.raw_every({"raw": ""}) == 1
+    assert cli.raw_every({"raw": "1000"}) == 1000
+    assert cli.raw_every({"raw": "0"}) == 1
+
+
+def test_duration_is_readable() -> None:
+    assert format_duration(4.4) == "4 s"
+    assert format_duration(75) == "1 min 15 s"
+    assert format_duration(119.6) == "2 min 00 s"
+
+
+def test_live_monitor_shows_progress_and_ram() -> None:
+    counters = new_quality_counters()
+    counters["funnel"]["read"] = 500
+    counters["funnel"]["analysed"] = 480
+    counters["rejects"]["ip"] = 20
+    monitor = LiveMonitor(1000, total=1000)
+    screen = io.StringIO()
+    with contextlib.redirect_stdout(screen):
+        monitor.check(counters, {"bruteforce": 2})
+        # Le délai de 1000 s n'est pas écoulé : rien de plus ne s'affiche.
+        monitor.check(counters, {"bruteforce": 2})
+    text = screen.getvalue()
+    assert text.count("RAM") == 1
+    assert " 50 %, reste" in text and "lues 500" in text
+    assert "analysées 480 | rejetées 20 | alertes 2" in text
+    assert len(monitor.trace) == 1 and monitor.peak > 0
+    with contextlib.redirect_stdout(screen):
+        monitor.check(counters, {}, final=True)
+    assert len(monitor.trace) == 2
+
+
+def test_live_monitor_is_silent_with_show() -> None:
+    path = os.path.join(WORK, "dataset_show", "logs.log")
+    screen = io.StringIO()
+    with contextlib.redirect_stdout(screen):
+        summary = run_pipeline(
+            [path], os.path.join(WORK, "run_ram"), display=LineDisplay(3)
+        )
+    text = screen.getvalue()
+    # Avec --show, chaque ligne affiche sa RAM, sans ligne de suivi.
+    assert text.count(" Mo\n") == 3 and "lignes/s" not in text
+    assert summary["performance"]["memory_trace"]
+
+
+def test_pipeline_follows_ram_until_the_end() -> None:
+    path = os.path.join(WORK, "dataset_show", "logs.log")
+    screen = io.StringIO()
+    with contextlib.redirect_stdout(screen):
+        summary = run_pipeline([path], os.path.join(WORK, "run_live"))
+    trace = summary["performance"]["memory_trace"]
+    assert trace[-1]["lines"] == summary["quality"]["funnel"]["read"]
+    assert summary["performance"]["peak_memory_mb"] >= trace[-1]["memory_mb"]
+    # Le manifeste donne le total : la dernière ligne indique 100 %.
+    assert "100 % | lues" in screen.getvalue()
+
+
+def test_command_line_refresh_option() -> None:
+    assert cli.refresh_delay({}) == 1
+    assert cli.refresh_delay({"refresh": "5"}) == 5
+    assert cli.refresh_delay({"refresh": "0.5"}) == 0.5
+    try:
+        cli.refresh_delay({"refresh": "0"})
+    except ValueError:
+        return
+    raise AssertionError("--refresh=0 accepté")
+
+
+def test_command_line_show_options() -> None:
+    assert cli.parse_options(["--show"]) == {"log-file": [], "show": ""}
+    assert cli.show_limit({"show": ""}) == 0
+    assert cli.show_limit({"show": "30"}) == 30
+    assert cli.show_limit({}) is None
+    assert cli.make_display({"log-file": []}) is None
+    assert cli.make_display({"only": "router"}).only == "router"
+    try:
+        cli.make_display({"only": "banane"})
+    except ValueError:
+        return
+    raise AssertionError("--only inconnu accepté")
+
+
 def test_empty_file() -> None:
     os.makedirs(WORK, exist_ok=True)
     path = os.path.join(WORK, "vide.log")
@@ -407,7 +626,9 @@ def main() -> None:
     tests = [v for k, v in globals().items() if k.startswith("test_")]
     for test in tests:
         try:
-            test()
+            # Les affichages du programme ne doivent pas noyer le résultat.
+            with contextlib.redirect_stdout(io.StringIO()):
+                test()
             print(f"ok      {test.__name__}")
         except AssertionError as error:
             failures += 1

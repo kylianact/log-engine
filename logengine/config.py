@@ -19,7 +19,14 @@ NULL_USERS = ("", "null", "none", "n/a", "anonymous", "unknown")
 SECRET_PATTERN = r"(password|token)=\S+"
 
 # Nombre de lignes traitées d'un coup : c'est lui qui borne la RAM.
-BATCH_SIZE = 10000
+# Un petit lot reste dans le cache du processeur, ce qui va aussi plus vite.
+BATCH_SIZE = 1000
+
+# Délai en secondes entre deux lignes du suivi en direct (--refresh).
+REFRESH_SECONDS = 1.0
+
+# Les vieilles clés de la force brute sont oubliées tous les N lots.
+FORGET_EVERY = 100
 
 # Taille maximale des dictionnaires de cache et d'état.
 MAX_CACHE_SIZE = 300000

@@ -13,12 +13,8 @@ import json
 from logengine.config import FIELD_COUNT
 
 
-def parse_json_payload(text: str, quality: dict) -> dict | None:
-    """Lit un payload JSON, et tente de le réparer s'il est abîmé."""
-    try:
-        return json.loads(text)
-    except ValueError:
-        pass
+def repair_json_payload(text: str, quality: dict) -> dict | None:
+    """Tente de réparer un JSON illisible. Retourne None en cas d'échec."""
     # Deux défauts réparables : virgule en trop, guillemets simples.
     for repaired in (text.replace(",}", "}"), text.replace("'", '"')):
         try:
@@ -92,10 +88,16 @@ def parse_line(line: str, quality: dict) -> dict:
         "raw": line,
     }
     text = parts[5].strip()
+    # Le tri recopie ce texte tel quel, sauf s'il a fallu le corriger.
+    record["text"] = text
     if text.startswith("{"):
-        record["payload"] = parse_json_payload(text, quality)
-        if record["payload"] is None:
-            record["reject"] = "json"
+        try:
+            record["payload"] = json.loads(text)
+        except ValueError:
+            record["payload"] = repair_json_payload(text, quality)
+            record["text"] = None
+            if record["payload"] is None:
+                record["reject"] = "json"
     elif text.startswith("conn=("):
         connection = parse_connection(text)
         if connection is None:

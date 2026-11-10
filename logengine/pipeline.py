@@ -7,8 +7,6 @@ import time
 from collections import defaultdict
 from typing import Iterator, TextIO
 
-import psutil
-
 from logengine import audit
 from logengine.aggregation import Aggregator
 from logengine.bruteforce import BruteForceDetector
@@ -17,11 +15,14 @@ from logengine.config import (
     BATCH_SIZE,
     FAST_THRESHOLD,
     FAST_WINDOW,
+    REFRESH_SECONDS,
     SLOW_THRESHOLD,
     SLOW_WINDOW,
 )
+from logengine.display import LineDisplay, print_raw_lines, trace_stream
 from logengine.evaluation import evaluate
 from logengine.ingestion import limit_lines, read_sources, total_size
+from logengine.monitor import LiveMonitor
 from logengine.rules import ALL_RULES, apply_security_rules
 from logengine.sorting import LogSorter
 from logengine.transform import build_record_stream, new_quality_counters
@@ -46,8 +47,11 @@ class AlertLog:
     heure : une IP bavarde donne une alerte par heure, pas un million.
     """
 
-    def __init__(self, file: TextIO) -> None:
+    def __init__(
+        self, file: TextIO, display: LineDisplay | None = None
+    ) -> None:
         self.file = file
+        self.display = display
         self.last_seen = {}
         self.hits = defaultdict(int)
         self.published = defaultdict(int)
@@ -69,6 +73,8 @@ class AlertLog:
             self.published[rule] += 1
             alert["timestamp"] = moment.isoformat()
             self.file.write(json.dumps(alert, ensure_ascii=False) + "\n")
+            if self.display is not None:
+                self.display.alerts.append(alert)
 
 
 def load_blacklist(path: str) -> frozenset:
@@ -110,29 +116,42 @@ def run_pipeline(
     blacklist_path: str | None = None,
     max_lines: int = 0,
     sort_logs: bool = True,
+    display: LineDisplay | None = None,
+    raw_every: int = 0,
+    refresh: float = REFRESH_SECONDS,
 ) -> dict:
     """Exécute le pipeline et retourne le résumé.
 
     lines permet de fournir un flux simulé à la place des fichiers.
+    display affiche chaque ligne : le traitement se fait alors ligne par
+    ligne, ce qui convient à une démonstration mais pas aux 15 Go.
+    raw_every affiche une ligne brute sur raw_every pendant l'analyse normale.
+    refresh est le délai en secondes entre deux lignes du suivi en direct.
     """
     os.makedirs(output, exist_ok=True)
     started = time.time()
-    process = psutil.Process()
     quality = new_quality_counters()
     aggregator = Aggregator()
     fast = BruteForceDetector(FAST_THRESHOLD, FAST_WINDOW, "bruteforce")
     slow = BruteForceDetector(SLOW_THRESHOLD, SLOW_WINDOW, "slow")
     state = {"port_scan": {}, "spray": {}, "travel": {}}
     rule_errors = defaultdict(int)
-    memory_trace = []
-    peak_memory = 0
     batch_count = 0
 
     size = total_size(paths)
+    # Le manifeste du générateur donne le nombre total de lignes : le suivi
+    # en direct peut alors afficher un pourcentage et le temps restant.
+    manifest = load_manifest(paths, size)
+    expected = manifest["lines"] if manifest is not None else 0
+    if max_lines > 0 and (expected == 0 or max_lines < expected):
+        expected = max_lines
+    monitor = LiveMonitor(refresh, expected, display is None)
     if lines is None:
         lines = read_sources(paths)
     if max_lines > 0:
         lines = limit_lines(lines, max_lines)
+    if raw_every > 0 and display is None:
+        lines = print_raw_lines(lines, raw_every)
     if blacklist_path is None:
         folder = os.path.dirname(paths[0])
         blacklist_path = os.path.join(folder, "blacklist.conf")
@@ -145,15 +164,22 @@ def run_pipeline(
     bad_path = os.path.join(output, "bad_lines.log")
     with open(alerts_path, "w", encoding="utf-8") as alerts_file:
         with open(bad_path, "w", encoding="utf-8") as bad_lines:
-            alert_log = AlertLog(alerts_file)
-            records = build_record_stream(lines, quality, bad_lines)
-            for batch in make_batches(records, BATCH_SIZE):
+            alert_log = AlertLog(alerts_file, display)
+            if display is None:
+                batch_size = BATCH_SIZE
+                records = build_record_stream(lines, quality, bad_lines)
+            else:
+                batch_size = 1
+                records = trace_stream(lines, quality, bad_lines, display)
+            for batch in make_batches(records, batch_size):
                 batch_count += 1
                 aggregator.update(batch)
                 if sorter is not None:
                     sorter.write(batch)
-                fast.run_cycle(batch, alert_log.publish)
-                slow.run_cycle(batch, alert_log.publish)
+                # La force brute ne concerne que les connexions.
+                logins = [r for r in batch if r["service"] == "auth"]
+                fast.run_cycle(logins, alert_log.publish)
+                slow.run_cycle(logins, alert_log.publish)
                 alerts = apply_security_rules(
                     *ALL_RULES,
                     records=batch,
@@ -162,29 +188,16 @@ def run_pipeline(
                     errors=rule_errors,
                 )
                 alert_log.publish(alerts)
-                if batch_count % 100 == 0:
-                    memory = process.memory_info().rss / 1048576
-                    peak_memory = max(peak_memory, memory)
-                    memory_trace.append(
-                        {
-                            "lines": quality["funnel"]["read"],
-                            "memory_mb": round(memory, 1),
-                            "seconds": round(time.time() - started, 1),
-                        }
-                    )
-                    print(
-                        f"{quality['funnel']['read']} lignes lues, "
-                        f"RAM {memory:.0f} Mo, "
-                        f"{time.time() - started:.0f} s"
-                    )
+                # Une ligne de suivi par seconde : avancement et RAM.
+                monitor.check(quality, alert_log.published)
     if sorter is not None:
         sorter.close()
+    # Dernière mesure, à la fin du fichier.
+    monitor.check(quality, alert_log.published, final=True)
 
     # Sous Windows, une exécution très courte peut mesurer 0 seconde.
     seconds = max(time.time() - started, 0.001)
-    memory = process.memory_info().rss / 1048576
-    peak_memory = max(peak_memory, memory)
-    read = quality["funnel"]["read"]
+    read = quality["funnel"].get("read", 0)
     quality_dict = {name: dict(v) for name, v in quality.items()}
     sorted_lines = dict(sorter.counts) if sorter is not None else {}
     summary = {
@@ -194,9 +207,9 @@ def run_pipeline(
             "lines_per_second": round(read / seconds),
             "megabytes_per_second": round(size / 1000000 / seconds, 1),
             "batches": batch_count,
-            "batch_size": BATCH_SIZE,
-            "peak_memory_mb": round(peak_memory, 1),
-            "memory_trace": memory_trace,
+            "batch_size": batch_size,
+            "peak_memory_mb": round(monitor.peak, 1),
+            "memory_trace": monitor.trace,
         },
         "quality": quality_dict,
         "sorted_lines": dict(sorted(sorted_lines.items())),
@@ -210,8 +223,9 @@ def run_pipeline(
         },
     }
 
-    manifest = load_manifest(paths, size)
-    if manifest is not None and max_lines == 0:
+    # La vérité terrain ne vaut que si tout le fichier a été lu.
+    stopped = display is not None and display.finished()
+    if manifest is not None and max_lines == 0 and not stopped:
         summary["evaluation"] = evaluate(
             quality_dict, alert_log.entities, manifest
         )

@@ -7,7 +7,7 @@ de connexion dans une fenêtre de temps, sans réussite entre deux.
 from datetime import datetime, timedelta
 from typing import Callable
 
-from logengine.config import MAX_ALERTS_PER_PASS
+from logengine.config import FORGET_EVERY, MAX_ALERTS_PER_PASS
 
 
 class BruteForceDetector:
@@ -59,7 +59,8 @@ class BruteForceDetector:
             else:
                 position = len(batch)
                 self.completed_cycles += 1
-                self.forget_old_keys(batch[-1]["timestamp"])
+                if self.completed_cycles % FORGET_EVERY == 0:
+                    self.forget_old_keys(batch[-1]["timestamp"])
             publish(alerts)
 
     def on_failure(self, key: tuple, moment: datetime) -> dict | None:

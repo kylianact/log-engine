@@ -39,8 +39,9 @@ def new_quality_counters() -> dict:
 
 def count_stage(items: Iterator, name: str, quality: dict) -> Iterator:
     """Laisse passer un flux en comptant ses éléments."""
+    funnel = quality["funnel"]
     for item in items:
-        quality["funnel"][name] += 1
+        funnel[name] += 1
         yield item
 
 
@@ -59,9 +60,10 @@ def sanitize_line(line: str, quality: dict) -> str:
     return cleaned.strip()
 
 
-def drop_duplicates(lines: Iterator, quality: dict) -> Iterator[str]:
+def drop_duplicates(
+    lines: Iterator, quality: dict, previous: str | None = None
+) -> Iterator[str]:
     """Retire les lignes répétées juste à la suite."""
-    previous = None
     for line in lines:
         if line == previous:
             quality["repairs"]["duplicate"] += 1
@@ -155,6 +157,7 @@ def mask_secrets(record: dict, quality: dict) -> None:
         return
     cleaned = re.sub(SECRET_PATTERN, r"\1=***", text)
     quality["repairs"]["secret_masked"] += 1
+    record["text"] = None
     if isinstance(payload, str):
         record["payload"] = cleaned
     else:
@@ -228,6 +231,14 @@ def keep_record(record: dict, quality: dict, bad_lines: TextIO) -> bool:
 def route_record(record: dict) -> dict:
     """Range un enregistrement selon la forme de son payload."""
     match record["payload"]:
+        case str() as text if text.startswith("%"):
+            route = "network_device"
+        case str():
+            route = "raw_text"
+        case (_, port, _) if port in SENSITIVE_PORTS:
+            route = "connection_sensitive"
+        case (_, _, _):
+            route = "connection"
         case {"path": "/health"}:
             route = "healthcheck"
         case {"level": "ERROR" | "CRITICAL", "code": int()}:
@@ -250,23 +261,22 @@ def route_record(record: dict) -> dict:
             route = "machine_metric"
         case dict():
             route = "json_other"
-        case (_, port, _) if port in SENSITIVE_PORTS:
-            route = "connection_sensitive"
-        case (_, _, _):
-            route = "connection"
-        case str() as text if text.startswith("%"):
-            route = "network_device"
-        case str():
-            route = "raw_text"
         case _:
             route = "unknown"
     record["route"] = route
     return record
 
 
-def build_record_stream(lines: Iterator, quality: dict,
-                        bad_lines: TextIO) -> Iterator[dict]:
-    """Assemble le pipeline. Rien n'est lu avant de parcourir le flux."""
+def build_record_stream(
+    lines: Iterator,
+    quality: dict,
+    bad_lines: TextIO,
+    previous: str | None = None,
+) -> Iterator[dict]:
+    """Assemble le pipeline. Rien n'est lu avant de parcourir le flux.
+
+    previous est la ligne d'avant, quand le flux reprend en cours de route.
+    """
     read = count_stage(lines, "read", quality)
     cleaned = map(lambda line: sanitize_line(line, quality), read)
     # filter(None, ...) retire les chaînes vides.
@@ -276,7 +286,7 @@ def build_record_stream(lines: Iterator, quality: dict,
         "data_lines",
         quality,
     )
-    unique = drop_duplicates(data_lines, quality)
+    unique = drop_duplicates(data_lines, quality, previous)
     parsed = map(lambda line: parse_line(line, quality), unique)
     normalized = map(lambda rec: normalize_record(rec, quality), parsed)
     valid = count_stage(
