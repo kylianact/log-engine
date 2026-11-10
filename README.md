@@ -186,7 +186,6 @@ Le payload a trois formes :
         pipeline.py          enchaînement des étapes
         evaluation.py        comparaison avec la vérité terrain
         charts.py            graphiques matplotlib
-    data/sample/             jeu de test fourni
     tests/                   tests du projet
     docs/rapport.pdf         rapport final
 
